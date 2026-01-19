@@ -63,10 +63,19 @@ function Assert-Admin {
 }
 
 function Get-ScriptDir {
-  $d = Split-Path -Parent $MyInvocation.MyCommand.Path
-  if (-not $d) { $d = (Get-Location).Path }
-  return $d
+  if ($PSCommandPath) {
+    return Split-Path -Parent $PSCommandPath
+  }
+
+  # Fallbacks (older hosts / edge cases)
+  if ($MyInvocation.MyCommand -and $MyInvocation.MyCommand.Path) {
+    return Split-Path -Parent $MyInvocation.MyCommand.Path
+  }
+
+  # Last resort: current directory
+  return (Get-Location).Path
 }
+
 
 function Backup-RegistryValue {
   param(
@@ -139,11 +148,15 @@ function Write-Section($title) {
 function Confirm-OrAbort {
   param([string]$Message)
 
-  if ($Force) { return }
-  $ans = Read-Host "$Message (Y/N)"
-  if ($ans -notin @('Y','y','YES','Yes','yes')) {
-    throw "Aborted by user."
+  if ($Force) { return $true }
+
+  $ans = (Read-Host "$Message (Y/N)").Trim()
+  if ($ans -in @('Y','y','YES','Yes','yes')) {
+    return $true
   }
+
+  Write-Host "Cancelled by user." -ForegroundColor Yellow
+  return $false
 }
 
 function Get-DisplayClassInstances {
@@ -245,45 +258,64 @@ $explicit =
   $ApplyRecommended -or $RevertFromLatestBackup -or $ListBackups -or
   $DisableMpo -or $RevertMpo -or $DisableAspm -or $DisableUlps -or $TouchUlpsNA -or $DisableHibernate -or $SetTimeouts
 
-function Show-MenuAndSetFlags {
-  Write-Host ""
-  Write-Host "Fix-RDNA3-DisplayWake" -ForegroundColor Cyan
-  Write-Host "Pick an option:" -ForegroundColor Cyan
-  Write-Host "  1) Apply RECOMMENDED fixes (safe defaults)" -ForegroundColor Green
-  Write-Host "  2) Revert from LATEST backup" -ForegroundColor Yellow
-  Write-Host "  3) Disable MPO only" -ForegroundColor White
-  Write-Host "  4) Disable PCIe ASPM only" -ForegroundColor White
-  Write-Host "  5) Disable ULPS only (EnableUlps=0 where present)" -ForegroundColor White
-  Write-Host "  6) Set OLED-safe timeouts only" -ForegroundColor White
-  Write-Host "  7) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
-  Write-Host "  8) List backups" -ForegroundColor White
-  Write-Host "  9) Exit" -ForegroundColor White
-  Write-Host ""
+function Show-MenuAndGetChoice {
+  while ($true) {
+    Write-Host ""
+    Write-Host "Fix-RDNA3-DisplayWake" -ForegroundColor Cyan
+    Write-Host "Pick an option:" -ForegroundColor Cyan
+    Write-Host "  1) Apply RECOMMENDED fixes (safe defaults)" -ForegroundColor Green
+    Write-Host "  2) Revert from LATEST backup" -ForegroundColor Yellow
+    Write-Host "  3) Disable MPO only" -ForegroundColor White
+    Write-Host "  4) Disable PCIe ASPM only" -ForegroundColor White
+    Write-Host "  5) Disable ULPS only (EnableUlps=0 where present)" -ForegroundColor White
+    Write-Host "  6) Set OLED-safe timeouts only" -ForegroundColor White
+    Write-Host "  7) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
+    Write-Host "  8) List backups" -ForegroundColor White
+    Write-Host "  9) Exit" -ForegroundColor White
+    Write-Host ""
 
-  $choice = Read-Host "Enter 1-9"
-  switch ($choice) {
-    '1' { Set-Variable -Name ApplyRecommended -Value $true -Scope Script; break }
-    '2' { Set-Variable -Name RevertFromLatestBackup -Value $true -Scope Script; break }
-    '3' { Set-Variable -Name DisableMpo -Value $true -Scope Script; break }
-    '4' { Set-Variable -Name DisableAspm -Value $true -Scope Script; break }
-    '5' { Set-Variable -Name DisableUlps -Value $true -Scope Script; break }
-    '6' { Set-Variable -Name SetTimeouts -Value $true -Scope Script; break }
-    '7' { Set-Variable -Name TouchUlpsNA -Value $true -Scope Script; break }
-    '8' { Set-Variable -Name ListBackups -Value $true -Scope Script; break }
-    default { throw "Exit." }
+    $choice = (Read-Host "Enter 1-9").Trim()
+
+    switch ($choice) {
+      '1' { return "APPLY_RECOMMENDED" }
+      '2' { return "REVERT_LATEST" }
+      '3' { return "DISABLE_MPO" }
+      '4' { return "DISABLE_ASPM" }
+      '5' { return "DISABLE_ULPS" }
+      '6' { return "SET_TIMEOUTS" }
+      '7' { return "TOUCH_ULPS_NA" }
+      '8' { return "LIST_BACKUPS" }
+      '9' { return "EXIT" }
+      default {
+        Write-Host "Invalid choice '$choice'. Please enter a number 1-9." -ForegroundColor Yellow
+      }
+    }
   }
 }
 
 if (-not $explicit) {
-  Show-MenuAndSetFlags
+  $action = Show-MenuAndGetChoice
+
+  switch ($action) {
+    "APPLY_RECOMMENDED" { $ApplyRecommended = $true }
+    "REVERT_LATEST"     { $RevertFromLatestBackup = $true }
+    "DISABLE_MPO"       { $DisableMpo = $true }
+    "DISABLE_ASPM"      { $DisableAspm = $true }
+    "DISABLE_ULPS"      { $DisableUlps = $true }
+    "SET_TIMEOUTS"      { $SetTimeouts = $true }
+    "TOUCH_ULPS_NA"     { $TouchUlpsNA = $true }
+    "LIST_BACKUPS"      { $ListBackups = $true }
+    "EXIT" {
+      Write-Host "Exiting." -ForegroundColor Yellow
+      return
+    }
+  }
 }
 
-# Expand recommended into individual actions
 if ($ApplyRecommended) {
   $DisableMpo = $true
   $DisableAspm = $true
   $DisableUlps = $true
-  # Do NOT enable TouchUlpsNA here (must be explicit)
 }
 
 # ---------------- Backups / List / Revert ----------------
@@ -311,7 +343,7 @@ if ($RevertFromLatestBackup) {
   Write-Host "Action: Revert from latest backup" -ForegroundColor Yellow
   Write-Host "DryRun: $($script:IsDryRun)"
   Write-Host "Backup: $latest"
-  Confirm-OrAbort "Proceed to revert?"
+  if (-not (Confirm-OrAbort "Proceed to revert?")) { return }
 
   Restore-FromBackupJson -BackupFile $latest
 
@@ -343,11 +375,10 @@ Write-Host " - A JSON backup will be written before applying any registry change
 Write-Host " - EnableUlps_NA is NOT touched unless you explicitly choose it."
 Write-Host ""
 
-Confirm-OrAbort "Proceed with these changes?"
+if (-not (Confirm-OrAbort "Proceed with these changes?")) { return }
 
 # ---------------- Apply changes ----------------
 
-# Write backup file path now (we’ll fill and write once we have changes)
 $backupFile = Join-Path $scriptDir ("Fix-RDNA3-DisplayWake.backup.{0}.json" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
 $logFile    = Join-Path $scriptDir ("Fix-RDNA3-DisplayWake.log.{0}.txt" -f (Get-Date).ToString("yyyyMMdd-HHmmss"))
 
@@ -411,7 +442,6 @@ if ($DisableUlps -or $TouchUlpsNA) {
           $log.Add("ULPS_NA: [$($inst.PSChildName)] EnableUlps_NA not found -> skipped")
         }
         elseif ($prevUlpsNA.Type -ne "DWord") {
-          # Critical safety: never type-force
           $log.Add("ULPS_NA: [$($inst.PSChildName)] Exists but type is $($prevUlpsNA.Type) -> skipped (no type forcing)")
         }
         else {
@@ -473,8 +503,6 @@ if ($SetTimeouts) {
 }
 
 # ---------------- Write backup + logs ----------------
-
-# Always write logs; write backup even in DryRun (it’s useful as a “plan record”)
 try {
   ($backup | ConvertTo-Json -Depth 10) | Out-File -FilePath $backupFile -Encoding UTF8
   $log | Out-File -FilePath $logFile -Encoding UTF8

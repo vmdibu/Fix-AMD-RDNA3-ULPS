@@ -24,5 +24,14 @@ A small PowerShell utility for AMD RDNA3 users who experience:
 
 Open **PowerShell as Administrator** in the script folder and run:
 
+USAGE
+- Recommended:
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1
+  powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1
+
+- Non-interactive:
+```powershell
+  powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -ApplyRecommended -Force
+  powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -RevertFromLatestBackup -Force
+  powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -DryRun -ApplyRecommended
+
