@@ -51,72 +51,279 @@ param(
 
 # ---------------- Helpers ----------------
 
+function Get-DisplayClassInstances {
+  $displayClass = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+  if (-not (Test-Path $displayClass)) { return @() }
+  return @(Get-ChildItem $displayClass -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' })
+}
+
+function Get-AmdDisplayClassInstances {
+  $base = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+  if (-not (Test-Path $base)) { return @() }
+
+  $results = @()
+
+  try {
+    $children = Get-ChildItem -Path $base -ErrorAction SilentlyContinue
+  } catch {
+    Write-Host "ULPS: Cannot enumerate display class keys (ACL restriction)." -ForegroundColor Yellow
+    return @()
+  }
+
+  foreach ($c in $children) {
+    try {
+      $p = Get-ItemProperty -Path $c.PSPath -ErrorAction SilentlyContinue
+
+      if (
+        ($p.ProviderName -eq "Advanced Micro Devices, Inc.") -or
+        ($p.DriverDesc   -match "AMD|Radeon")
+      ) {
+        $results += $c
+      }
+    } catch {
+      # skip unreadable instance
+    }
+  }
+
+  return $results
+}
+
+function Load-StoreToAdrenalinMap_NoHeader {
+  param([Parameter(Mandatory=$true)][string]$Path)
+
+  if (-not (Test-Path $Path)) { return @{} }
+
+  $map = @{}
+  $lines = Get-Content -Path $Path -Encoding UTF8 -ErrorAction Stop
+
+  foreach ($line in $lines) {
+    $t = $line.Trim()
+    if (-not $t) { continue }
+    if ($t.StartsWith('#')) { continue }
+
+    # split into 2 parts max: storeDriver, adrenalin
+    $parts = $t -split ',', 2
+    if ($parts.Count -lt 2) { continue }
+
+    $store = $parts[0].Trim()
+    $adre  = $parts[1].Trim()
+
+    if ($store -and $adre) {
+      $map[$store] = $adre
+    }
+  }
+
+  return $map
+}
+
+function Get-AmdStoreDriverVersion {
+  $amd = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon' })
+  if ($amd.Count -eq 0) { return $null }
+  return [string]$amd[0].DriverVersion
+}
+
+function Resolve-AdrenalinFromStoreDriver {
+  param(
+    [Parameter(Mandatory=$true)][hashtable]$Map,
+    [Parameter(Mandatory=$true)][string]$StoreDriverVersion
+  )
+
+  if (-not $StoreDriverVersion) { return $null }
+  if ($Map.ContainsKey($StoreDriverVersion)) { return $Map[$StoreDriverVersion] }
+  return $null
+}
+
+function Resolve-UlpsPolicy {
+  param([string]$AdrenalinVersion)
+
+  $threshold = [version]'25.3.1'
+
+  $policy = [pscustomobject]@{
+    Name = 'Unknown_DefaultSafe'
+    DisableUlpsInRecommended = $false
+    Note = 'Adrenalin unknown; ULPS untouched by default'
+  }
+
+  if (-not $AdrenalinVersion) { return $policy }
+
+  try { $v = [version]$AdrenalinVersion } catch { return $policy }
+
+  if ($v -gt $threshold) {
+    return [pscustomobject]@{
+      Name = 'After_25.3.1'
+      DisableUlpsInRecommended = $true
+      Note = 'Adrenalin > 25.3.1: Recommended disables ULPS'
+    }
+  }
+
+  return [pscustomobject]@{
+    Name = 'AtOrBefore_25.3.1'
+    DisableUlpsInRecommended = $false
+    Note = 'Adrenalin <= 25.3.1: Recommended leaves ULPS untouched'
+  }
+}
+
 function Verify-CurrentSettings {
 
   Write-Section "Verifying current system state (read-only)"
 
-  # --- MPO ---
-  Write-Host "MPO (Windows DWM overlays):" -ForegroundColor Cyan
+  # In "Recommended" mode these are always targeted:
+  $wouldDisableMpo  = $true
+  $wouldDisableAspm = $true
+
+  # ULPS is driver-aware (policy decides)
+  $wouldDisableUlps = $false
+
+  function Show-Setting {
+    param(
+      [Parameter(Mandatory=$true)][string]$Title,
+      [Parameter(Mandatory=$true)][string]$Current,
+      [Parameter(Mandatory=$true)][string]$Planned,
+      [Parameter(Mandatory=$true)][bool]$WillChange
+    )
+
+    if ($WillChange) {
+      Write-Host ("[WILL CHANGE] {0}" -f $Title) -ForegroundColor Red
+    } else {
+      Write-Host ("[NO CHANGE ] {0}" -f $Title) -ForegroundColor Green
+    }
+    Write-Host ("  Current: {0}" -f $Current)
+    Write-Host ("  Planned: {0}" -f $Planned)
+    Write-Host ""
+  }
+
+  # ---------------- MPO ----------------
   $dwmPath = "HKLM:\SOFTWARE\Microsoft\Windows\Dwm"
+  $overlayVal = $null
+  $mpoCurrent = "Enabled/default (OverlayTestMode not set)"
+
   try {
     $mpo = Get-ItemProperty -Path $dwmPath -Name OverlayTestMode -ErrorAction Stop
-    if ($mpo.OverlayTestMode -eq 5) {
-      Write-Host "  Disabled (OverlayTestMode=5)" -ForegroundColor Green
-    } else {
-      Write-Host "  Custom value: $($mpo.OverlayTestMode)" -ForegroundColor Yellow
-    }
-  } catch {
-    Write-Host "  Enabled / default (OverlayTestMode not set)" -ForegroundColor Yellow
+    $overlayVal = $mpo.OverlayTestMode
+    $mpoCurrent = ("OverlayTestMode={0}" -f $overlayVal)
+  } catch {}
+
+  $mpoPlanned = "OverlayTestMode=5 (disable MPO)"
+  $mpoWillChange = $false
+  if ($wouldDisableMpo) {
+    if ($overlayVal -ne 5) { $mpoWillChange = $true }
   }
 
-  # --- ASPM ---
   Write-Host ""
+  Write-Host "MPO (Windows DWM overlays):" -ForegroundColor Cyan
+  Show-Setting -Title "OverlayTestMode" -Current $mpoCurrent -Planned $mpoPlanned -WillChange $mpoWillChange
+
+  # ---------------- ASPM ----------------
+  $acCur = $null
+  $dcCur = $null
+  try {
+    $q = powercfg -query SCHEME_CURRENT SUB_PCIEXPRESS ASPM
+    $acLine = $q | Select-String "Current AC Power Setting Index" | Select-Object -First 1
+    $dcLine = $q | Select-String "Current DC Power Setting Index" | Select-Object -First 1
+    if ($acLine) { $acCur = ($acLine -replace '.*:\s*','') }
+    if ($dcLine) { $dcCur = ($dcLine -replace '.*:\s*','') }
+  } catch {}
+
+  $acTxt = "<unknown>"
+  $dcTxt = "<unknown>"
+  if ($acCur) { $acTxt = $acCur }
+  if ($dcCur) { $dcTxt = $dcCur }
+
+  $aspmCurrent = ("AC={0}, DC={1}" -f $acTxt, $dcTxt)
+  $aspmPlanned = "AC=0x00000000, DC=0x00000000 (OFF)"
+  $aspmWillChange = $false
+  if ($wouldDisableAspm) {
+    if (($acCur -ne "0x00000000") -or ($dcCur -ne "0x00000000")) { $aspmWillChange = $true }
+  }
+
   Write-Host "PCIe ASPM (Link State Power Management):" -ForegroundColor Cyan
-  $scheme = (powercfg /getactivescheme) -join ""
-  Write-Host "  Active scheme: $scheme"
+  Show-Setting -Title "Power scheme PCIe ASPM" -Current $aspmCurrent -Planned $aspmPlanned -WillChange $aspmWillChange
 
-  $ac = powercfg -query SCHEME_CURRENT SUB_PCIEXPRESS ASPM | Select-String "Current AC Power Setting Index"
-  $dc = powercfg -query SCHEME_CURRENT SUB_PCIEXPRESS ASPM | Select-String "Current DC Power Setting Index"
+  # ---------------- Driver mapping (Store -> Adrenalin) + ULPS policy ----------------
+  Write-Host "AMD Driver mapping (Windows Store -> Adrenalin):" -ForegroundColor Cyan
 
-  Write-Host "  AC: $($ac -replace '.*:\s*','')"
-  Write-Host "  DC: $($dc -replace '.*:\s*','')"
+  $mapPath = Join-Path (Get-ScriptDir) "data\adrenalin-mapping.csv"
 
-  # --- ULPS ---
+  $storeVer = Get-AmdStoreDriverVersion
+  $storeTxt = "<unknown>"
+  if ($storeVer) { $storeTxt = $storeVer }
+
+  $adreVer  = $null
+  $adreTxt  = "<unknown> (not in mapping)"
+  $policy   = Resolve-UlpsPolicy -AdrenalinVersion $null
+
+  if (-not (Test-Path $mapPath)) {
+    Write-Host "  Mapping file not found:" -ForegroundColor Yellow
+    Write-Host ("    {0}" -f $mapPath) -ForegroundColor Yellow
+    Write-Host "  (Create it with lines like: 32.0.13031.3015,25.3.1)" -ForegroundColor Yellow
+  } else {
+    $map = Load-StoreToAdrenalinMap_NoHeader -Path $mapPath
+    if ($storeVer) {
+      $adreVer = Resolve-AdrenalinFromStoreDriver -Map $map -StoreDriverVersion $storeVer
+      if ($adreVer) { $adreTxt = $adreVer } else { $adreTxt = "<unknown> (not in mapping)" }
+      $policy = Resolve-UlpsPolicy -AdrenalinVersion $adreVer
+    }
+  }
+
+  Write-Host ("  AMD store driver: {0}" -f $storeTxt)
+  Write-Host ("  Adrenalin:        {0}" -f $adreTxt)
+  Write-Host ("  ULPS policy:      {0}" -f $policy.Note)
+
+  if ($policy -and $policy.DisableUlpsInRecommended) { $wouldDisableUlps = $true }
+
+  # ---------------- ULPS (per adapter instance) ----------------
   Write-Host ""
   Write-Host "ULPS (AMD display adapters):" -ForegroundColor Cyan
-  $instances = Get-DisplayClassInstances
 
+  $instances = Get-AmdDisplayClassInstances
   if ($instances.Count -eq 0) {
     Write-Host "  No display-class instances found." -ForegroundColor Yellow
-  }
+  } else {
+    foreach ($inst in $instances) {
+      $p  = $inst.PSPath
+      $id = $inst.PSChildName
 
-  foreach ($inst in $instances) {
-    $p = $inst.PSPath
-    Write-Host "  Instance $($inst.PSChildName):"
+      # EnableUlps
+      $ulpsExists = $false
+      $ulpsCurVal = $null
+      $ulpsCurTxt = "(not present)"
 
-    foreach ($name in @("EnableUlps","EnableUlps_NA")) {
       try {
-        $item = Get-ItemProperty -Path $p -Name $name -ErrorAction Stop
-        $kind = (Get-Item -Path $p).GetValueKind($name)
-        Write-Host "    $name = $($item.$name) ($kind)"
-      } catch {
-        Write-Host "    $name = <not present>"
-      }
-    }
-  }
+        $item = Get-ItemProperty -Path $p -Name "EnableUlps" -ErrorAction Stop
+        $ulpsExists = $true
+        $ulpsCurVal = [int]$item.EnableUlps
+        $ulpsCurTxt = ("EnableUlps={0}" -f $ulpsCurVal)
+      } catch {}
 
-  # --- GPU info ---
-  Write-Host ""
-  Write-Host "GPU:" -ForegroundColor Cyan
-  Get-CimInstance Win32_VideoController | ForEach-Object {
-    Write-Host "  $($_.Name)"
-    Write-Host "    Driver: $($_.DriverVersion)"
+      $ulpsPlannedTxt = "Leave as-is"
+      $ulpsWillChange = $false
+
+      if ($wouldDisableUlps) {
+        if ($ulpsExists) {
+          $ulpsPlannedTxt = "EnableUlps=0"
+          if ($ulpsCurVal -ne 0) { $ulpsWillChange = $true }
+        } else {
+          $ulpsPlannedTxt = "Skip (not present)"
+        }
+      }
+
+      Show-Setting -Title ("Instance {0} - EnableUlps" -f $id) -Current $ulpsCurTxt -Planned $ulpsPlannedTxt -WillChange $ulpsWillChange
+
+      # EnableUlps_NA (verify only; recommended never changes)
+      $naCurTxt = "(not present)"
+      try {
+        $na = Get-ItemProperty -Path $p -Name "EnableUlps_NA" -ErrorAction Stop
+        $kind = (Get-Item -Path $p).GetValueKind("EnableUlps_NA")
+        $naCurTxt = ("EnableUlps_NA={0} ({1})" -f $na.EnableUlps_NA, $kind)
+      } catch {}
+
+      Show-Setting -Title ("Instance {0} - EnableUlps_NA" -f $id) -Current $naCurTxt -Planned "Leave as-is (recommended never touches it)" -WillChange $false
+    }
   }
 
   Write-Host ""
   Write-Host "Verification complete. No changes were made." -ForegroundColor Green
 }
-
 
 function Assert-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -225,12 +432,6 @@ function Confirm-OrAbort {
 
   Write-Host "Cancelled by user." -ForegroundColor Yellow
   return $false
-}
-
-function Get-DisplayClassInstances {
-  $displayClass = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-  if (-not (Test-Path $displayClass)) { return @() }
-  return @(Get-ChildItem $displayClass -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' })
 }
 
 function Get-LatestBackupFile {
@@ -389,9 +590,28 @@ if ($VerifySettings) {
 }
 
 if ($ApplyRecommended) {
-  $DisableMpo = $true
+  $DisableMpo  = $true
   $DisableAspm = $true
-  $DisableUlps = $true
+
+  $mapPath  = Join-Path (Get-ScriptDir) "data\adrenalin-mapping.csv"
+  $map      = Load-StoreToAdrenalinMap_NoHeader -Path $mapPath
+  $storeVer = Get-AmdStoreDriverVersion
+  $adreVer  = if ($storeVer) { Resolve-AdrenalinFromStoreDriver -Map $map -StoreDriverVersion $storeVer } else { $null }
+  $policy   = Resolve-UlpsPolicy -AdrenalinVersion $adreVer
+
+  Write-Host ""
+  Write-Host "Driver-aware Recommended policy:" -ForegroundColor Cyan
+  Write-Host ("  AMD store driver: {0}" -f $(if ($storeVer) { $storeVer } else { "<unknown>" }))
+  Write-Host ("  Adrenalin:        {0}" -f $(if ($adreVer)  { $adreVer }  else { "<unknown> (not in mapping)" }))
+  Write-Host ("  Policy:           {0} - {1}" -f $policy.Name, $policy.Note)
+
+  if ($policy.DisableUlpsInRecommended) {
+    $DisableUlps = $true
+    Write-Host "  Action: ULPS will be disabled (EnableUlps=0 where present)" -ForegroundColor Yellow
+  } else {
+    $DisableUlps = $false
+    Write-Host "  Action: ULPS will NOT be modified" -ForegroundColor Green
+  }
 }
 
 # ---------------- Backups / List / Revert ----------------
@@ -487,7 +707,7 @@ elseif ($DisableMpo) {
 }
 
 # --- 2) ULPS (display adapter class instances) ---
-$instances = Get-DisplayClassInstances
+$instances = Get-AmdDisplayClassInstances
 if ($DisableUlps -or $TouchUlpsNA) {
   if ($instances.Count -eq 0) {
     $log.Add("ULPS: No display-class instances found (unexpected).")
