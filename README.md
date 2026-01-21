@@ -38,8 +38,6 @@ When you choose **1) Apply RECOMMENDED fixes**, the script applies:
 The script targets *display adapter instances only* under the Windows display class key.  
 It does **not** blindly create ULPS keys that aren’t already there.
 
----
-
 ## What it does NOT change (important)
 
 - **It does not touch `EnableUlps_NA`** unless you explicitly opt-in using the Advanced option.
@@ -88,6 +86,8 @@ USAGE
   powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -DryRun -ApplyRecommended
 ```
 
+---
+
 ## Contributing / Support
 
 If you encounter issues:
@@ -96,6 +96,8 @@ If you encounter issues:
    ```powershell
    powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -VerifySettings
    ```
+
+---
 
 ## Disclaimer
 
