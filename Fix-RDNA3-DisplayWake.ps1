@@ -33,6 +33,7 @@ param(
   [switch]$ListBackups,
   [switch]$DryRun,
   [switch]$Force,
+  [switch]$VerifySettings,
 
   # Individual toggles (advanced / scripting use)
   [switch]$DisableMpo,
@@ -49,6 +50,73 @@ param(
 )
 
 # ---------------- Helpers ----------------
+
+function Verify-CurrentSettings {
+
+  Write-Section "Verifying current system state (read-only)"
+
+  # --- MPO ---
+  Write-Host "MPO (Windows DWM overlays):" -ForegroundColor Cyan
+  $dwmPath = "HKLM:\SOFTWARE\Microsoft\Windows\Dwm"
+  try {
+    $mpo = Get-ItemProperty -Path $dwmPath -Name OverlayTestMode -ErrorAction Stop
+    if ($mpo.OverlayTestMode -eq 5) {
+      Write-Host "  Disabled (OverlayTestMode=5)" -ForegroundColor Green
+    } else {
+      Write-Host "  Custom value: $($mpo.OverlayTestMode)" -ForegroundColor Yellow
+    }
+  } catch {
+    Write-Host "  Enabled / default (OverlayTestMode not set)" -ForegroundColor Yellow
+  }
+
+  # --- ASPM ---
+  Write-Host ""
+  Write-Host "PCIe ASPM (Link State Power Management):" -ForegroundColor Cyan
+  $scheme = (powercfg /getactivescheme) -join ""
+  Write-Host "  Active scheme: $scheme"
+
+  $ac = powercfg -query SCHEME_CURRENT SUB_PCIEXPRESS ASPM | Select-String "Current AC Power Setting Index"
+  $dc = powercfg -query SCHEME_CURRENT SUB_PCIEXPRESS ASPM | Select-String "Current DC Power Setting Index"
+
+  Write-Host "  AC: $($ac -replace '.*:\s*','')"
+  Write-Host "  DC: $($dc -replace '.*:\s*','')"
+
+  # --- ULPS ---
+  Write-Host ""
+  Write-Host "ULPS (AMD display adapters):" -ForegroundColor Cyan
+  $instances = Get-DisplayClassInstances
+
+  if ($instances.Count -eq 0) {
+    Write-Host "  No display-class instances found." -ForegroundColor Yellow
+  }
+
+  foreach ($inst in $instances) {
+    $p = $inst.PSPath
+    Write-Host "  Instance $($inst.PSChildName):"
+
+    foreach ($name in @("EnableUlps","EnableUlps_NA")) {
+      try {
+        $item = Get-ItemProperty -Path $p -Name $name -ErrorAction Stop
+        $kind = (Get-Item -Path $p).GetValueKind($name)
+        Write-Host "    $name = $($item.$name) ($kind)"
+      } catch {
+        Write-Host "    $name = <not present>"
+      }
+    }
+  }
+
+  # --- GPU info ---
+  Write-Host ""
+  Write-Host "GPU:" -ForegroundColor Cyan
+  Get-CimInstance Win32_VideoController | ForEach-Object {
+    Write-Host "  $($_.Name)"
+    Write-Host "    Driver: $($_.DriverVersion)"
+  }
+
+  Write-Host ""
+  Write-Host "Verification complete. No changes were made." -ForegroundColor Green
+}
+
 
 function Assert-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -271,10 +339,11 @@ function Show-MenuAndGetChoice {
     Write-Host "  6) Set OLED-safe timeouts only" -ForegroundColor White
     Write-Host "  7) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
     Write-Host "  8) List backups" -ForegroundColor White
-    Write-Host "  9) Exit" -ForegroundColor White
+    Write-Host "  9) Verify current settings (read-only)" -ForegroundColor White
+    Write-Host "  0) Exit" -ForegroundColor White
     Write-Host ""
 
-    $choice = (Read-Host "Enter 1-9").Trim()
+    $choice = (Read-Host "Enter 0-9").Trim()
 
     switch ($choice) {
       '1' { return "APPLY_RECOMMENDED" }
@@ -285,7 +354,8 @@ function Show-MenuAndGetChoice {
       '6' { return "SET_TIMEOUTS" }
       '7' { return "TOUCH_ULPS_NA" }
       '8' { return "LIST_BACKUPS" }
-      '9' { return "EXIT" }
+      '9' { return "VERIFY" }
+      '0' { return "EXIT" }
       default {
         Write-Host "Invalid choice '$choice'. Please enter a number 1-9." -ForegroundColor Yellow
       }
@@ -305,11 +375,17 @@ if (-not $explicit) {
     "SET_TIMEOUTS"      { $SetTimeouts = $true }
     "TOUCH_ULPS_NA"     { $TouchUlpsNA = $true }
     "LIST_BACKUPS"      { $ListBackups = $true }
+    "VERIFY"            { $VerifySettings = $true }
     "EXIT" {
       Write-Host "Exiting." -ForegroundColor Yellow
       return
     }
   }
+}
+
+if ($VerifySettings) {
+  Verify-CurrentSettings
+  return
 }
 
 if ($ApplyRecommended) {
