@@ -87,3 +87,24 @@ USAGE
   powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -RevertFromLatestBackup -Force
   powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -DryRun -ApplyRecommended
 ```
+
+## Contributing / Support
+
+If you encounter issues:
+
+1. Run **Verify current settings**:
+   ```powershell
+   powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -VerifySettings
+   ```
+
+## Disclaimer
+
+This script modifies Windows registry values and power management settings.
+
+Use at your own risk
+
+Always keep the generated backup .json files
+
+Revert using the built-in rollback option if needed
+
+The author assumes no responsibility for system instability or data loss.
