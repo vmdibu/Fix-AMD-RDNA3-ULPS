@@ -3,6 +3,7 @@
 WHAT THIS DOES
 - Optionally disables MPO (Windows DWM overlays) via OverlayTestMode=5
 - Disables PCIe Link State Power Management (ASPM) for the CURRENT power plan
+- Optionally disables HAGS (Hardware-accelerated GPU scheduling) via HwSchMode=1
 - Disables AMD ULPS (EnableUlps=0) ONLY where the value already exists
 - NEVER touches EnableUlps_NA unless you explicitly opt-in, and even then:
     - it will ONLY change it if it already exists as a REG_DWORD (no type forcing)
@@ -25,6 +26,8 @@ USAGE
   .\Fix-RDNA3-DisplayWake.ps1 -ApplyRecommended -Force
   .\Fix-RDNA3-DisplayWake.ps1 -RevertFromLatestBackup -Force
   .\Fix-RDNA3-DisplayWake.ps1 -DryRun -ApplyRecommended
+  .\Fix-RDNA3-DisplayWake.ps1 -DisableHags -Force
+  .\Fix-RDNA3-DisplayWake.ps1 -RevertHags -Force
 
 - Persistent ULPS protection task:
   .\Fix-RDNA3-DisplayWake.ps1 -InstallUlpsProtectionTask
@@ -50,6 +53,8 @@ param(
   # Individual toggles (advanced / scripting use)
   [switch]$DisableMpo,
   [switch]$RevertMpo,
+  [switch]$DisableHags,
+  [switch]$RevertHags,
   [switch]$DisableAspm,
   [switch]$DisableUlps,
   [switch]$TouchUlpsNA,      # advanced + opt-in
@@ -278,6 +283,7 @@ function Verify-CurrentSettings {
 
   # In "Recommended" mode these are always targeted:
   $wouldDisableMpo  = $true
+  $wouldDisableHags = $true
   $wouldDisableAspm = $true
 
   # ULPS is driver-aware (policy decides)
@@ -321,6 +327,26 @@ function Verify-CurrentSettings {
   Write-Host ""
   Write-Host "MPO (Windows DWM overlays):" -ForegroundColor Cyan
   Show-Setting -Title "OverlayTestMode" -Current $mpoCurrent -Planned $mpoPlanned -WillChange $mpoWillChange
+
+  # ---------------- HAGS ----------------
+  $graphicsDriversPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+  $hagsVal = $null
+  $hagsCurrent = "Default (HwSchMode not set)"
+
+  try {
+    $hags = Get-ItemProperty -Path $graphicsDriversPath -Name HwSchMode -ErrorAction Stop
+    $hagsVal = $hags.HwSchMode
+    $hagsCurrent = ("HwSchMode={0}" -f $hagsVal)
+  } catch {}
+
+  $hagsPlanned = "HwSchMode=1 (disable HAGS)"
+  $hagsWillChange = $false
+  if ($wouldDisableHags) {
+    if ($hagsVal -ne 1) { $hagsWillChange = $true }
+  }
+
+  Write-Host "HAGS (Hardware-accelerated GPU scheduling):" -ForegroundColor Cyan
+  Show-Setting -Title "HwSchMode" -Current $hagsCurrent -Planned $hagsPlanned -WillChange $hagsWillChange
 
   # ---------------- ASPM ----------------
   $acCur = $null
@@ -875,7 +901,7 @@ $scriptDir = Get-ScriptDir
 $explicit =
   $ApplyRecommended -or $RevertFromLatestBackup -or $ListBackups -or
   $InstallUlpsProtectionTask -or $VerifyUlpsProtectionTask -or $UninstallUlpsProtectionTask -or $RepairUlpsFromTask -or
-  $DisableMpo -or $RevertMpo -or $DisableAspm -or $DisableUlps -or $TouchUlpsNA -or $DisableHibernate -or $SetTimeouts
+  $DisableMpo -or $RevertMpo -or $DisableHags -or $RevertHags -or $DisableAspm -or $DisableUlps -or $TouchUlpsNA -or $DisableHibernate -or $SetTimeouts
 
 function Show-MenuAndGetChoice {
   while ($true) {
@@ -885,36 +911,40 @@ function Show-MenuAndGetChoice {
     Write-Host "  1) Apply RECOMMENDED fixes (safe defaults)" -ForegroundColor Green
     Write-Host "  2) Revert from LATEST backup" -ForegroundColor Yellow
     Write-Host "  3) Disable MPO only" -ForegroundColor White
-    Write-Host "  4) Disable PCIe ASPM only" -ForegroundColor White
-    Write-Host "  5) Disable ULPS only (EnableUlps=0 where present)" -ForegroundColor White
-    Write-Host "  6) Set OLED-safe timeouts only" -ForegroundColor White
-    Write-Host "  7) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
-    Write-Host "  8) List backups" -ForegroundColor White
-    Write-Host "  9) Verify current settings (read-only)" -ForegroundColor White
-    Write-Host "  10) Install persistent ULPS protection task" -ForegroundColor White
-    Write-Host "  11) Verify persistent ULPS protection task" -ForegroundColor White
-    Write-Host "  12) Remove persistent ULPS protection task" -ForegroundColor White
+    Write-Host "  4) Disable HAGS only" -ForegroundColor White
+    Write-Host "  5) Revert HAGS tweak only" -ForegroundColor White
+    Write-Host "  6) Disable PCIe ASPM only" -ForegroundColor White
+    Write-Host "  7) Disable ULPS only (EnableUlps=0 where present)" -ForegroundColor White
+    Write-Host "  8) Set OLED-safe timeouts only" -ForegroundColor White
+    Write-Host "  9) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
+    Write-Host "  10) List backups" -ForegroundColor White
+    Write-Host "  11) Verify current settings (read-only)" -ForegroundColor White
+    Write-Host "  12) Install persistent ULPS protection task" -ForegroundColor White
+    Write-Host "  13) Verify persistent ULPS protection task" -ForegroundColor White
+    Write-Host "  14) Remove persistent ULPS protection task" -ForegroundColor White
     Write-Host "  0) Exit" -ForegroundColor White
     Write-Host ""
 
-    $choice = (Read-Host "Enter 0-12").Trim()
+    $choice = (Read-Host "Enter 0-14").Trim()
 
     switch ($choice) {
       '1' { return "APPLY_RECOMMENDED" }
       '2' { return "REVERT_LATEST" }
       '3' { return "DISABLE_MPO" }
-      '4' { return "DISABLE_ASPM" }
-      '5' { return "DISABLE_ULPS" }
-      '6' { return "SET_TIMEOUTS" }
-      '7' { return "TOUCH_ULPS_NA" }
-      '8' { return "LIST_BACKUPS" }
-      '9' { return "VERIFY" }
-      '10' { return "INSTALL_ULPS_TASK" }
-      '11' { return "VERIFY_ULPS_TASK" }
-      '12' { return "UNINSTALL_ULPS_TASK" }
+      '4' { return "DISABLE_HAGS" }
+      '5' { return "REVERT_HAGS" }
+      '6' { return "DISABLE_ASPM" }
+      '7' { return "DISABLE_ULPS" }
+      '8' { return "SET_TIMEOUTS" }
+      '9' { return "TOUCH_ULPS_NA" }
+      '10' { return "LIST_BACKUPS" }
+      '11' { return "VERIFY" }
+      '12' { return "INSTALL_ULPS_TASK" }
+      '13' { return "VERIFY_ULPS_TASK" }
+      '14' { return "UNINSTALL_ULPS_TASK" }
       '0' { return "EXIT" }
       default {
-        Write-Host "Invalid choice '$choice'. Please enter a number 0-12." -ForegroundColor Yellow
+        Write-Host "Invalid choice '$choice'. Please enter a number 0-14." -ForegroundColor Yellow
       }
     }
   }
@@ -927,6 +957,8 @@ if (-not $explicit) {
     "APPLY_RECOMMENDED" { $ApplyRecommended = $true }
     "REVERT_LATEST"     { $RevertFromLatestBackup = $true }
     "DISABLE_MPO"       { $DisableMpo = $true }
+    "DISABLE_HAGS"      { $DisableHags = $true }
+    "REVERT_HAGS"       { $RevertHags = $true }
     "DISABLE_ASPM"      { $DisableAspm = $true }
     "DISABLE_ULPS"      { $DisableUlps = $true }
     "SET_TIMEOUTS"      { $SetTimeouts = $true }
@@ -970,6 +1002,7 @@ if ($UninstallUlpsProtectionTask) {
 
 if ($ApplyRecommended) {
   $DisableMpo  = $true
+  $DisableHags = $true
   $DisableAspm = $true
 
   $mapPath  = Join-Path (Get-ScriptDir) "data\adrenalin-mapping.csv"
@@ -1035,6 +1068,8 @@ Write-Host ("DryRun: {0}" -f $script:IsDryRun) -ForegroundColor Yellow
 
 if ($DisableMpo) { Write-Host " - Set OverlayTestMode=5 (disable MPO)" }
 if ($RevertMpo)  { Write-Host " - Remove OverlayTestMode (revert MPO tweak)" }
+if ($DisableHags){ Write-Host " - Set HwSchMode=1 (disable HAGS)" }
+if ($RevertHags) { Write-Host " - Remove HwSchMode (revert HAGS tweak)" }
 if ($DisableAspm){ Write-Host " - Set PCIe ASPM (Link State Power Mgmt) OFF for current power plan" }
 if ($DisableUlps){ Write-Host " - Set EnableUlps=0 where present under display class instances" }
 if ($TouchUlpsNA){ Write-Host " - Advanced: Set EnableUlps_NA=0 ONLY if it exists as DWORD (no type forcing)" -ForegroundColor DarkYellow }
@@ -1085,7 +1120,35 @@ elseif ($DisableMpo) {
   $script:DidChangeSomething = $true
 }
 
-# --- 2) ULPS (display adapter class instances) ---
+# --- 2) HAGS ---
+$graphicsDriversPath = "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
+if ($RevertHags) {
+  $prev = Backup-RegistryValue -Path $graphicsDriversPath -Name "HwSchMode"
+  $backup.Changes += [ordered]@{
+    Key      = $graphicsDriversPath
+    Name     = "HwSchMode"
+    Previous = $prev
+    New      = @{ Type="(removed)"; Value=$null }
+  }
+
+  $removed = Remove-RegistryValue -Path $graphicsDriversPath -Name "HwSchMode"
+  $log.Add("HAGS: removed HwSchMode (revert). Removed=$removed")
+  $script:DidChangeSomething = $true
+}
+elseif ($DisableHags) {
+  $prev = Backup-RegistryValue -Path $graphicsDriversPath -Name "HwSchMode"
+  $backup.Changes += [ordered]@{
+    Key      = $graphicsDriversPath
+    Name     = "HwSchMode"
+    Previous = $prev
+    New      = @{ Type="REG_DWORD"; Value=1 }
+  }
+  Set-RegistryDword -Path $graphicsDriversPath -Name "HwSchMode" -Value 1
+  $log.Add("HAGS: set HwSchMode=1 (disable Hardware-accelerated GPU scheduling)")
+  $script:DidChangeSomething = $true
+}
+
+# --- 3) ULPS (display adapter class instances) ---
 $instances = Get-AmdDisplayClassInstances
 if ($DisableUlps -or $TouchUlpsNA) {
   if ($instances.Count -eq 0) {
@@ -1135,7 +1198,7 @@ if ($DisableUlps -or $TouchUlpsNA) {
   }
 }
 
-# --- 3) PCIe ASPM OFF ---
+# --- 4) PCIe ASPM OFF ---
 if ($DisableAspm) {
   try {
     if (-not $script:IsDryRun) {
@@ -1150,7 +1213,7 @@ if ($DisableAspm) {
   }
 }
 
-# --- 4) Hibernate OFF (optional) ---
+# --- 5) Hibernate OFF (optional) ---
 if ($DisableHibernate) {
   try {
     if (-not $script:IsDryRun) { powercfg /hibernate off | Out-Null }
@@ -1161,7 +1224,7 @@ if ($DisableHibernate) {
   }
 }
 
-# --- 5) Timeouts (optional) ---
+# --- 6) Timeouts (optional) ---
 if ($SetTimeouts) {
   try {
     if (-not $script:IsDryRun) {
