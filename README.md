@@ -133,6 +133,17 @@ If you encounter issues:
    powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -VerifySettings
    ```
 
+## Maintaining driver mapping
+
+`data\adrenalin-mapping.csv` is updated by a daily GitHub Actions workflow from AMD GPUOpen's Radeon Vulkan driver version table. When the workflow detects a mapping update, it commits the refreshed CSV and creates a GitHub Release tagged with the newest Adrenalin and Windows Driver Store versions.
+
+Run the updater locally with PowerShell 7+:
+
+```powershell
+pwsh ./scripts/Update-AdrenalinMapping.ps1
+pwsh ./scripts/Update-AdrenalinMapping.ps1 -VerifyOnly
+```
+
 ---
 
 ## Disclaimer

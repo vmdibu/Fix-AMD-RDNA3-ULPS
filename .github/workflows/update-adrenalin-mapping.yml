@@ -1,0 +1,92 @@
+name: Update Adrenalin Mapping
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-adrenalin-mapping
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Verify and update mapping
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update mapping from AMD GPUOpen
+        shell: pwsh
+        run: ./scripts/Update-AdrenalinMapping.ps1
+
+      - name: Verify updater is idempotent
+        shell: pwsh
+        run: ./scripts/Update-AdrenalinMapping.ps1 -VerifyOnly
+
+      - name: Collect release metadata
+        id: mapping
+        shell: bash
+        run: |
+          if git diff --quiet -- data/adrenalin-mapping.csv; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_row="$(awk -F, 'NF >= 2 && $1 !~ /^#/ { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }' data/adrenalin-mapping.csv)"
+          latest_store_driver="${latest_row%%,*}"
+          latest_adrenalin="${latest_row#*,}"
+          tag="adrenalin-mapping-v${latest_adrenalin}-driver-${latest_store_driver}"
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "latest_store_driver=$latest_store_driver" >> "$GITHUB_OUTPUT"
+          echo "latest_adrenalin=$latest_adrenalin" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated mapping
+        if: steps.mapping.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/adrenalin-mapping.csv
+          git commit -m "Update Adrenalin driver mapping"
+          git push
+
+      - name: Create release for driver mapping update
+        if: steps.mapping.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.mapping.outputs.tag }}
+          LATEST_ADRENALIN: ${{ steps.mapping.outputs.latest_adrenalin }}
+          LATEST_STORE_DRIVER: ${{ steps.mapping.outputs.latest_store_driver }}
+        run: |
+          git fetch --tags
+
+          if git rev-parse -q --verify "refs/tags/$RELEASE_TAG" >/dev/null; then
+            echo "Release tag already exists: $RELEASE_TAG"
+            exit 0
+          fi
+
+          git tag "$RELEASE_TAG"
+          git push origin "$RELEASE_TAG"
+
+          cat > release-notes.md <<EOF
+          Updated AMD Windows Driver Store mapping from AMD GPUOpen.
+
+          Latest Adrenalin: $LATEST_ADRENALIN
+          Latest Windows Driver Store version: $LATEST_STORE_DRIVER
+
+          This release contains the refreshed data/adrenalin-mapping.csv file.
+          EOF
+
+          gh release create "$RELEASE_TAG" \
+            data/adrenalin-mapping.csv \
+            --title "Adrenalin mapping $LATEST_ADRENALIN" \
+            --notes-file release-notes.md

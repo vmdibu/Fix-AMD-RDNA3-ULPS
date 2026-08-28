@@ -206,7 +206,7 @@ function Load-StoreToAdrenalinMap_NoHeader {
   $lines = Get-Content -Path $Path -Encoding UTF8 -ErrorAction Stop
 
   foreach ($line in $lines) {
-    $t = $line.Trim()
+    $t = $line.Trim().TrimStart([char]0xFEFF)
     if (-not $t) { continue }
     if ($t.StartsWith('#')) { continue }
 
