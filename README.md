@@ -8,6 +8,8 @@ A small PowerShell utility for AMD **RDNA3** users who experience:
 
 This script applies a few *common mitigations* (registry + power settings) and generates **timestamped backups** so you can revert.
 
+It can also install an optional persistent ULPS protection task that re-checks AMD display adapter registry instances after driver/device installation events and at system startup.
+
 ---
 
 ## What it changes
@@ -38,6 +40,38 @@ When you choose **1) Apply RECOMMENDED fixes**, the script applies:
 The script targets *display adapter instances only* under the Windows display class key.  
 It does **not** blindly create ULPS keys that aren’t already there.
 
+### Optional persistent ULPS protection
+
+The script can install a Windows Scheduled Task named `Fix-RDNA3-DisplayWake-ULPS-Protection`.
+
+The task:
+
+- runs as `SYSTEM` with highest privileges
+- triggers at system startup
+- triggers after relevant Plug and Play / driver installation events
+- waits about 45 seconds before checking the registry
+- enumerates actual AMD display adapters, then resolves each adapter’s Display Class registry instance from its PNP device ID
+- only changes `EnableUlps` when it already exists and is set to `1`
+- leaves `EnableUlps=0` unchanged
+- never modifies `EnableUlps_NA`
+- does not run the full Recommended fixes
+- does not require `data\adrenalin-mapping.csv`
+- writes timestamped ULPS protection logs, and writes a backup when it changes a value
+
+Install, verify, and remove it from an elevated PowerShell:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -InstallUlpsProtectionTask
+powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -VerifyUlpsProtectionTask
+powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -UninstallUlpsProtectionTask
+```
+
+You can also run the same narrow repair manually:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -RepairUlpsFromTask
+```
+
 ## What it does NOT change (important)
 
 - **It does not touch `EnableUlps_NA`** unless you explicitly opt-in using the Advanced option.
@@ -55,6 +89,8 @@ It does **not** blindly create ULPS keys that aren’t already there.
 - Creates timestamped files next to the script:
   - `Fix-RDNA3-DisplayWake.backup.YYYYMMDD-HHMMSS.json`
   - `Fix-RDNA3-DisplayWake.log.YYYYMMDD-HHMMSS.txt`
+  - `Fix-RDNA3-DisplayWake.ulps-protection.backup.YYYYMMDD-HHMMSS.json`
+  - `Fix-RDNA3-DisplayWake.ulps-protection.log.YYYYMMDD-HHMMSS.txt`
 - Built-in rollback: revert from the **latest backup**
 - `-DryRun` mode: preview changes without applying anything
 - **Verify** mode: read-only report of current settings

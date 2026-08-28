@@ -6,6 +6,8 @@ WHAT THIS DOES
 - Disables AMD ULPS (EnableUlps=0) ONLY where the value already exists
 - NEVER touches EnableUlps_NA unless you explicitly opt-in, and even then:
     - it will ONLY change it if it already exists as a REG_DWORD (no type forcing)
+- Optionally installs a SYSTEM scheduled task that repairs only EnableUlps after
+  display driver/device installation events and at startup
 
 SAFETY FEATURES
 - Requires Admin
@@ -13,6 +15,7 @@ SAFETY FEATURES
 - Has built-in rollback from latest backup
 - Has DryRun mode (preview only)
 - Prints a clear "plan" before applying changes
+- Persistent ULPS repair is idempotent and does not run Recommended fixes
 
 USAGE
 - Recommended (from an elevated PowerShell):
@@ -22,6 +25,11 @@ USAGE
   .\Fix-RDNA3-DisplayWake.ps1 -ApplyRecommended -Force
   .\Fix-RDNA3-DisplayWake.ps1 -RevertFromLatestBackup -Force
   .\Fix-RDNA3-DisplayWake.ps1 -DryRun -ApplyRecommended
+
+- Persistent ULPS protection task:
+  .\Fix-RDNA3-DisplayWake.ps1 -InstallUlpsProtectionTask
+  .\Fix-RDNA3-DisplayWake.ps1 -VerifyUlpsProtectionTask
+  .\Fix-RDNA3-DisplayWake.ps1 -UninstallUlpsProtectionTask
 
 #>
 
@@ -34,6 +42,10 @@ param(
   [switch]$DryRun,
   [switch]$Force,
   [switch]$VerifySettings,
+  [switch]$InstallUlpsProtectionTask,
+  [switch]$VerifyUlpsProtectionTask,
+  [switch]$UninstallUlpsProtectionTask,
+  [switch]$RepairUlpsFromTask,
 
   # Individual toggles (advanced / scripting use)
   [switch]$DisableMpo,
@@ -43,6 +55,8 @@ param(
   [switch]$TouchUlpsNA,      # advanced + opt-in
   [switch]$DisableHibernate,
   [switch]$SetTimeouts,
+  [ValidateRange(0, 300)]
+  [int]$UlpsRepairDelaySeconds = 45,
   [ValidateRange(0, 240)]
   [int]$MonitorTimeoutMinutes = 10,
   [ValidateRange(0, 240)]
@@ -86,6 +100,101 @@ function Get-AmdDisplayClassInstances {
   }
 
   return $results
+}
+
+function ConvertTo-RegistrySafePnpId {
+  param([Parameter(Mandatory=$true)][string]$PnpDeviceId)
+  return ($PnpDeviceId -replace '/', '\')
+}
+
+function Get-RegistryValueData {
+  param(
+    [Parameter(Mandatory=$true)][string]$Path,
+    [Parameter(Mandatory=$true)][string]$Name
+  )
+
+  try {
+    $key = Get-Item -Path $Path -ErrorAction Stop
+    $names = @($key.GetValueNames())
+    if ($names -notcontains $Name) { return $null }
+
+    return [pscustomobject]@{
+      Exists = $true
+      Value  = $key.GetValue($Name)
+      Type   = $key.GetValueKind($Name).ToString()
+    }
+  } catch {
+    return $null
+  }
+}
+
+function Get-ActualAmdDisplayAdapters {
+  $adapters = @()
+
+  try {
+    $pnpDisplays = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
+      ($_.PNPClass -eq "Display") -and (
+        ($_.PNPDeviceID -match 'VEN_1002') -or
+        ($_.Manufacturer -match 'Advanced Micro Devices|AMD') -or
+        ($_.Name -match 'AMD|Radeon')
+      )
+    })
+  } catch {
+    Write-Host "ULPS: Cannot enumerate PnP display adapters." -ForegroundColor Yellow
+    return @()
+  }
+
+  foreach ($pnp in $pnpDisplays) {
+    $driverVersion = $null
+    try {
+      $signed = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { $_.DeviceID -eq $pnp.PNPDeviceID } | Select-Object -First 1)
+      if ($signed) { $driverVersion = [string]$signed.DriverVersion }
+    } catch {}
+
+    if (-not $driverVersion) {
+      try {
+        $video = @(Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.PNPDeviceID -eq $pnp.PNPDeviceID } | Select-Object -First 1)
+        if ($video) { $driverVersion = [string]$video.DriverVersion }
+      } catch {}
+    }
+
+    $adapters += [pscustomobject]@{
+      Name          = [string]$pnp.Name
+      PnpDeviceId   = [string]$pnp.PNPDeviceID
+      DriverVersion = $(if ($driverVersion) { $driverVersion } else { "<unknown>" })
+    }
+  }
+
+  return $adapters
+}
+
+function Resolve-DisplayClassInstanceForAdapter {
+  param([Parameter(Mandatory=$true)]$Adapter)
+
+  $displayClassGuid = "{4d36e968-e325-11ce-bfc1-08002be10318}"
+  $safePnpId = ConvertTo-RegistrySafePnpId -PnpDeviceId $Adapter.PnpDeviceId
+  $enumPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$safePnpId"
+
+  $driverValue = $null
+  try {
+    $enumProps = Get-ItemProperty -Path $enumPath -Name "Driver" -ErrorAction Stop
+    $driverValue = [string]$enumProps.Driver
+  } catch {
+    return $null
+  }
+
+  if ($driverValue -notmatch [regex]::Escape($displayClassGuid)) { return $null }
+
+  $instanceId = Split-Path -Leaf $driverValue
+  if ($instanceId -notmatch '^\d{4}$') { return $null }
+
+  $classPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\$displayClassGuid\$instanceId"
+  if (-not (Test-Path $classPath)) { return $null }
+
+  return [pscustomobject]@{
+    InstanceId = $instanceId
+    Path       = $classPath
+  }
 }
 
 function Load-StoreToAdrenalinMap_NoHeader {
@@ -508,6 +617,246 @@ function Restore-FromBackupJson {
   }
 }
 
+function Get-UlpsProtectionTaskName {
+  return "Fix-RDNA3-DisplayWake-ULPS-Protection"
+}
+
+function New-UlpsProtectionTaskXml {
+  param(
+    [Parameter(Mandatory=$true)][string]$ScriptPath,
+    [Parameter(Mandatory=$true)][int]$DelaySeconds
+  )
+
+  $escapedScript = [System.Security.SecurityElement]::Escape($ScriptPath)
+  $escapedWorkDir = [System.Security.SecurityElement]::Escape((Split-Path -Parent $ScriptPath))
+  $eventQuery = @"
+<QueryList>
+  <Query Id="0" Path="System">
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Kernel-PnP'] and (EventID=400 or EventID=410 or EventID=411 or EventID=430 or EventID=440)]]</Select>
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-UserPnp'] and (EventID=20001 or EventID=20003 or EventID=20006)]]</Select>
+  </Query>
+</QueryList>
+"@
+
+  return @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Repairs AMD EnableUlps after display driver/device installation events and at startup. Only changes existing EnableUlps values from 1 to 0.</Description>
+    <URI>\$(Get-UlpsProtectionTaskName)</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+    <EventTrigger>
+      <Enabled>true</Enabled>
+      <Subscription><![CDATA[$eventQuery]]></Subscription>
+    </EventTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="SYSTEM">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="SYSTEM">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "$escapedScript" -RepairUlpsFromTask -Force -UlpsRepairDelaySeconds $DelaySeconds</Arguments>
+      <WorkingDirectory>$escapedWorkDir</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"@
+}
+
+function Install-UlpsProtectionTask {
+  $taskName = Get-UlpsProtectionTaskName
+  $scriptPath = $PSCommandPath
+  if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+  if (-not $scriptPath) { throw "Cannot resolve script path for scheduled task registration." }
+
+  Write-Section "Installing persistent ULPS protection"
+  Write-Host "Task: $taskName"
+  Write-Host "Runs as: SYSTEM / HighestAvailable"
+  Write-Host "Triggers: system startup, display driver/device installation events"
+  Write-Host "Action: Repair EnableUlps only; Recommended fixes are not run"
+  Write-Host "Delay: approximately $UlpsRepairDelaySeconds seconds inside the repair action"
+  Write-Host ""
+
+  if (-not (Confirm-OrAbort "Install or update this scheduled task?")) { return }
+
+  if ($script:IsDryRun) {
+    Write-Host "DryRun: scheduled task was not installed." -ForegroundColor Yellow
+    return
+  }
+
+  $xml = New-UlpsProtectionTaskXml -ScriptPath $scriptPath -DelaySeconds $UlpsRepairDelaySeconds
+  Register-ScheduledTask -TaskName $taskName -Xml $xml -Force | Out-Null
+  Write-Host "Installed: $taskName" -ForegroundColor Green
+  Write-Host "Verify:"
+  Write-Host "  powershell.exe -ExecutionPolicy Bypass -File .\Fix-RDNA3-DisplayWake.ps1 -VerifyUlpsProtectionTask"
+}
+
+function Uninstall-UlpsProtectionTask {
+  $taskName = Get-UlpsProtectionTaskName
+
+  Write-Section "Removing persistent ULPS protection"
+  Write-Host "Task: $taskName"
+  if (-not (Confirm-OrAbort "Remove this scheduled task?")) { return }
+
+  if ($script:IsDryRun) {
+    Write-Host "DryRun: scheduled task was not removed." -ForegroundColor Yellow
+    return
+  }
+
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if (-not $task) {
+    Write-Host "Task is not installed." -ForegroundColor Yellow
+    return
+  }
+
+  Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+  Write-Host "Removed: $taskName" -ForegroundColor Green
+}
+
+function Verify-UlpsProtectionTask {
+  $taskName = Get-UlpsProtectionTaskName
+
+  Write-Section "Verifying persistent ULPS protection task"
+  $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+  if (-not $task) {
+    Write-Host "Task is not installed: $taskName" -ForegroundColor Yellow
+    return
+  }
+
+  $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+  Write-Host "Task:    $taskName"
+  Write-Host "State:   $($task.State)"
+  if ($info) {
+    Write-Host "LastRun: $($info.LastRunTime)"
+    Write-Host "Result:  $($info.LastTaskResult)"
+    Write-Host "NextRun: $($info.NextRunTime)"
+  }
+  Write-Host ""
+  Write-Host "Principal:"
+  Write-Host ("  UserId:   {0}" -f $task.Principal.UserId)
+  Write-Host ("  RunLevel: {0}" -f $task.Principal.RunLevel)
+  Write-Host ""
+  Write-Host "Triggers:"
+  $task.Triggers | ForEach-Object {
+    Write-Host ("  {0} Enabled={1}" -f $_.CimClass.CimClassName, $_.Enabled)
+  }
+  Write-Host ""
+  Write-Host "Action:"
+  $task.Actions | ForEach-Object {
+    Write-Host ("  {0} {1}" -f $_.Execute, $_.Arguments)
+  }
+}
+
+function Invoke-UlpsProtectionRepair {
+  Write-Section "Persistent ULPS protection repair"
+  Write-Host "Mode: repair EnableUlps only (no Recommended fixes, no EnableUlps_NA)"
+  Write-Host "Waiting $UlpsRepairDelaySeconds seconds before checking registry..."
+  if ($UlpsRepairDelaySeconds -gt 0) { Start-Sleep -Seconds $UlpsRepairDelaySeconds }
+
+  $scriptDir = Get-ScriptDir
+  $stamp = (Get-Date).ToString("yyyyMMdd-HHmmss")
+  $backupFile = Join-Path $scriptDir ("Fix-RDNA3-DisplayWake.ulps-protection.backup.{0}.json" -f $stamp)
+  $logFile = Join-Path $scriptDir ("Fix-RDNA3-DisplayWake.ulps-protection.log.{0}.txt" -f $stamp)
+  $repairLog = New-Object System.Collections.Generic.List[string]
+  $repairBackup = [ordered]@{
+    Timestamp = (Get-Date).ToString("s")
+    Operation = "PersistentUlpsProtectionRepair"
+    Changes   = @()
+  }
+  $changed = $false
+
+  $adapters = @(Get-ActualAmdDisplayAdapters)
+  if ($adapters.Count -eq 0) {
+    $repairLog.Add(("{0}`tGPU=<none>`tPNP=<none>`tDriver=<unknown>`tPrevious=<n/a>`tFinal=<n/a>`tAction=No actual AMD display adapters found" -f (Get-Date).ToString("s")))
+  }
+
+  foreach ($adapter in $adapters) {
+    $resolved = Resolve-DisplayClassInstanceForAdapter -Adapter $adapter
+    $timestamp = (Get-Date).ToString("s")
+
+    if (-not $resolved) {
+      $repairLog.Add(("{0}`tGPU={1}`tPNP={2}`tDriver={3}`tPrevious=<unresolved>`tFinal=<unresolved>`tAction=Could not resolve Display Class registry instance" -f $timestamp, $adapter.Name, $adapter.PnpDeviceId, $adapter.DriverVersion))
+      continue
+    }
+
+    $ulps = Get-RegistryValueData -Path $resolved.Path -Name "EnableUlps"
+    if (-not $ulps) {
+      $repairLog.Add(("{0}`tGPU={1}`tPNP={2}`tDriver={3}`tInstance={4}`tPrevious=<missing>`tFinal=<missing>`tAction=Skipped EnableUlps missing" -f $timestamp, $adapter.Name, $adapter.PnpDeviceId, $adapter.DriverVersion, $resolved.InstanceId))
+      continue
+    }
+
+    $previous = $ulps.Value
+    $final = $previous
+    $action = "No change"
+    $previousInt = 0
+    $hasNumericPrevious = [int]::TryParse(([string]$previous), [ref]$previousInt)
+
+    if ($hasNumericPrevious -and $previousInt -eq 1) {
+      $repairBackup.Changes += [ordered]@{
+        Key      = $resolved.Path
+        Name     = "EnableUlps"
+        Previous = @{ Exists=$true; Value=$previous; Type=$ulps.Type }
+        New      = @{ Type=$ulps.Type; Value=0 }
+      }
+
+      if (-not $script:IsDryRun) {
+        ($repairBackup | ConvertTo-Json -Depth 10) | Out-File -FilePath $backupFile -Encoding UTF8
+        Set-ItemProperty -Path $resolved.Path -Name "EnableUlps" -Value 0 -ErrorAction Stop
+      }
+      $final = 0
+      $action = "Set EnableUlps 1 -> 0"
+      $changed = $true
+      $script:DidChangeSomething = $true
+    } elseif ($hasNumericPrevious -and $previousInt -eq 0) {
+      $action = "Already 0"
+    } else {
+      $action = "Skipped unexpected EnableUlps value"
+    }
+
+    $repairLog.Add(("{0}`tGPU={1}`tPNP={2}`tDriver={3}`tInstance={4}`tPrevious={5}`tFinal={6}`tAction={7}" -f $timestamp, $adapter.Name, $adapter.PnpDeviceId, $adapter.DriverVersion, $resolved.InstanceId, $previous, $final, $action))
+  }
+
+  try {
+    if ($changed -or $script:IsDryRun) {
+      ($repairBackup | ConvertTo-Json -Depth 10) | Out-File -FilePath $backupFile -Encoding UTF8
+    }
+    $repairLog | Out-File -FilePath $logFile -Encoding UTF8
+  } catch {
+    Write-Host "Warning: couldn't write ULPS protection log/backup: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+
+  Write-Host "Log: $logFile"
+  if ($changed -or $script:IsDryRun) { Write-Host "Backup: $backupFile" }
+  $repairLog | ForEach-Object { Write-Host $_ }
+}
+
 # ---------------- Plan + State ----------------
 
 $script:IsDryRun = [bool]$DryRun
@@ -525,6 +874,7 @@ $scriptDir = Get-ScriptDir
 # If no explicit mode chosen, show menu
 $explicit =
   $ApplyRecommended -or $RevertFromLatestBackup -or $ListBackups -or
+  $InstallUlpsProtectionTask -or $VerifyUlpsProtectionTask -or $UninstallUlpsProtectionTask -or $RepairUlpsFromTask -or
   $DisableMpo -or $RevertMpo -or $DisableAspm -or $DisableUlps -or $TouchUlpsNA -or $DisableHibernate -or $SetTimeouts
 
 function Show-MenuAndGetChoice {
@@ -541,10 +891,13 @@ function Show-MenuAndGetChoice {
     Write-Host "  7) Advanced: Touch EnableUlps_NA (ONLY if DWORD, opt-in)" -ForegroundColor DarkYellow
     Write-Host "  8) List backups" -ForegroundColor White
     Write-Host "  9) Verify current settings (read-only)" -ForegroundColor White
+    Write-Host "  10) Install persistent ULPS protection task" -ForegroundColor White
+    Write-Host "  11) Verify persistent ULPS protection task" -ForegroundColor White
+    Write-Host "  12) Remove persistent ULPS protection task" -ForegroundColor White
     Write-Host "  0) Exit" -ForegroundColor White
     Write-Host ""
 
-    $choice = (Read-Host "Enter 0-9").Trim()
+    $choice = (Read-Host "Enter 0-12").Trim()
 
     switch ($choice) {
       '1' { return "APPLY_RECOMMENDED" }
@@ -556,9 +909,12 @@ function Show-MenuAndGetChoice {
       '7' { return "TOUCH_ULPS_NA" }
       '8' { return "LIST_BACKUPS" }
       '9' { return "VERIFY" }
+      '10' { return "INSTALL_ULPS_TASK" }
+      '11' { return "VERIFY_ULPS_TASK" }
+      '12' { return "UNINSTALL_ULPS_TASK" }
       '0' { return "EXIT" }
       default {
-        Write-Host "Invalid choice '$choice'. Please enter a number 1-9." -ForegroundColor Yellow
+        Write-Host "Invalid choice '$choice'. Please enter a number 0-12." -ForegroundColor Yellow
       }
     }
   }
@@ -577,6 +933,9 @@ if (-not $explicit) {
     "TOUCH_ULPS_NA"     { $TouchUlpsNA = $true }
     "LIST_BACKUPS"      { $ListBackups = $true }
     "VERIFY"            { $VerifySettings = $true }
+    "INSTALL_ULPS_TASK" { $InstallUlpsProtectionTask = $true }
+    "VERIFY_ULPS_TASK"  { $VerifyUlpsProtectionTask = $true }
+    "UNINSTALL_ULPS_TASK" { $UninstallUlpsProtectionTask = $true }
     "EXIT" {
       Write-Host "Exiting." -ForegroundColor Yellow
       return
@@ -584,8 +943,28 @@ if (-not $explicit) {
   }
 }
 
+if ($RepairUlpsFromTask) {
+  Invoke-UlpsProtectionRepair
+  return
+}
+
 if ($VerifySettings) {
   Verify-CurrentSettings
+  return
+}
+
+if ($InstallUlpsProtectionTask) {
+  Install-UlpsProtectionTask
+  return
+}
+
+if ($VerifyUlpsProtectionTask) {
+  Verify-UlpsProtectionTask
+  return
+}
+
+if ($UninstallUlpsProtectionTask) {
+  Uninstall-UlpsProtectionTask
   return
 }
 
