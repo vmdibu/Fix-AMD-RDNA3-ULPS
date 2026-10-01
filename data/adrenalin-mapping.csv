@@ -1,6 +1,8 @@
 # Source: AMD GPUOpen Radeon Vulkan Drivers Version Table
 # Updated by scripts/Update-AdrenalinMapping.ps1
 # Format: Windows Driver Store Version,Adrenalin Release
+32.0.32015.2008,26.9.2
+32.0.21045.11001,26.9.2
 32.0.31041.3013,26.9.1
 32.0.21045.9003,26.9.1
 32.0.31041.1004,26.8.1
